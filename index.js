@@ -342,7 +342,9 @@ function parseModule(m) {
     label: moduleDisplayText().replace(/"/g, /'/),
     depth: m.depth,
     issuers: m.reasons
-    // Stats.js filters out modules only https://github.com/webpack/webpack/blob/5433b8cc785c6e71c29ce5f932ae6595f2d7acb5/lib/Stats.js#L335
+      // Filter out the "entry" reason, which is redundant as far as I can tell
+      .filter(d => d.type !== 'entry')
+      // Stats.js filters out modules only https://github.com/webpack/webpack/blob/5433b8cc785c6e71c29ce5f932ae6595f2d7acb5/lib/Stats.js#L335
       .map(d => ({
         // again make sure to use string for id:
         graphId: d.moduleId.toString(),
@@ -355,7 +357,7 @@ function parseModule(m) {
     name: m.name,
     hasExports: !!m.providedExports,
     providedExports: m.providedExports || [],
-    usedExports: m.usedExports | [],
+    usedExports: m.usedExports || [],
     index: m.index,
     index2: m.index2,
   }
@@ -429,7 +431,8 @@ function buildGraph(stats) {
       .map(parseModule)
       .filter(showModule);
 
-    const clusterDetails = parseClusterDetails(chunkIds.map(c => stats.chunks[c]));
+    // const clusterDetails = parseClusterDetails(chunkIds.map(c => stats.chunks[c]));
+    const clusterDetails = parseClusterDetails(chunkIds.map(c => stats.chunks.find(chunk => chunk.id === c)));
     const chunkCluster = createStyledCluster(graph, clusterDetails);
 
     function createModuleNode(cluster, m) {
