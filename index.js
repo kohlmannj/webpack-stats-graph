@@ -62,6 +62,18 @@ const argv = yargs
     'archive-graphs': {
       default: true,
       desc: 'Write all files to output-folder/archive/<stats.hash>, this is useful to build a history of graphs to compare. An index is cataloged in output-folder/archive/index.html',
+    },
+    'hide-pattern': {
+      default: false,
+      desc: 'A JavaScript regular expression string (case-insensitive) used to hide dependencies, thereby reducing clutter in the resulting graph.'
+    },
+    'common-basenames-pattern': {
+      default: undefined,
+      description: 'A JavaScript regular expression string (case-insensitive) used to match common filenames and folders, so that the resulting graph can add additional file path fragments to clarify which file/s are pictured.'
+    },
+    graphviz: {
+      default: 'dot',
+      description: 'The Graphviz layout algorithm to use: either dot, neato, fdp, sfdp, twopi or circo. See http://www.graphviz.org/#roadmap for more details.'
     }
   })
   .help()
@@ -87,6 +99,28 @@ const showQueryString = argv.showQueryString;
 
 const showAssets = argv.showFiles;
 
+const hideRegex = argv.hidePattern ? new RegExp(argv.hidePattern, 'i') : undefined;
+
+const commonBasenamesRegex = argv.commonBasenamesPattern
+  ? new RegExp(argv.commonBasenamesPattern, 'i')
+  : undefined;
+
+const needsReadableBasename = (/** @type {string} */ filePath) => {
+  return !commonBasenamesRegex || commonBasenamesRegex.test(filePath);
+};
+
+const createReadableBasename = (/** @type {string} */ filePath) => {
+  if (!commonBasenamesRegex) return filePath;
+
+  const pathSplit = filePath.split(path.sep).reverse();
+  let finalName = '';
+  for (const pathFragment of pathSplit) {
+    finalName = path.join(pathFragment, finalName);
+    if (!commonBasenamesRegex.test(finalName)) break;
+  }
+  return finalName;
+}
+
 // COLORS:
 const redHue = 0;
 const greenHue = 105;
@@ -95,6 +129,7 @@ const turquoiseHue = 180;
 const blueHue = 225;
 const yellowHue = 60;
 const purpleHue = 260;
+const tsBlueHue = 211;
 const brownHue = 30;
 
 const doNothing = m => m;
@@ -140,9 +175,18 @@ ShellString(graph.to_dot()).to(dotFile);
 const svgFile = path.join(outputDirectory, 'graph.svg');
 // I was using graphviz to call dot but it didn't fail gracefully so I'm calling the command directly.
 // this needs adjusted if you use a different type of graph layout (not dot)
-const render = exec(`dot -Tsvg -o ${svgFile} ${dotFile}`);
-if (render.code !== 0) {
-  error('Render failed');
+const renderSvg = exec(`${argv.graphviz} -Tsvg -o ${svgFile} ${dotFile}`);
+if (renderSvg.code !== 0) {
+  error('Render SVG failed');
+  process.exit(1);
+}
+
+const pdfFile = path.join(outputDirectory, 'graph.pdf');
+// I was using graphviz to call dot but it didn't fail gracefully so I'm calling the command directly.
+// this needs adjusted if you use a different type of graph layout (not dot)
+const renderPdf = exec(`${argv.graphviz} -Tpdf -o ${pdfFile} ${dotFile}`);
+if (renderPdf.code !== 0) {
+  error('Render PDF failed');
   process.exit(1);
 }
 
@@ -182,6 +226,9 @@ function styleModuleNode(node, m) {
         return orangeHue;
       case '.js':
         return greenHue;
+      case '.ts':
+      case '.tsx':
+        return tsBlueHue;
       default:
         return yellowHue;
     }
@@ -239,7 +286,21 @@ function showModule(m) {
       // allow a few other images to show (1.png, 2.png) for illustrative purposes but hide rest to avoid overwhelming number of card images
       || !m.label.match(/(\d\d|[A-z]|[3456789])\.png$/);
   }
+  if (hideRegex && hideRegex.test(m.name)) return false;
   return true;
+}
+
+/** Hide the module if it has zero visible issuers */
+function showModulePassTwo(m, _, modules) {
+  if (m.reasons.find(r => r.type === 'entry')) return true;
+
+  const uniqueIssuerGraphIds = [...new Set(m.issuers.map(issuer => issuer.graphId))];
+  for (const graphId of uniqueIssuerGraphIds) {
+    if (modules.find(module => module.graphId === graphId)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function dependencyDisplayText(dep) {
@@ -289,8 +350,10 @@ function parseModule(m) {
   function moduleDisplayText() {
 
     if (isNodeModule) {
-      // note - file collisions can happen by stripping folders:
-      return packageDetails.filename || m.name;
+      return createReadableBasename(
+        path.join(packageDetails.name, packageDetails.filePath) ||
+        m.name
+      );
     }
 
     const hasLoaders = m.name.includes('!');
@@ -319,7 +382,12 @@ function parseModule(m) {
               return showPackageName;
             }
             return showPackageName + ' - ' + showFile;
-          } else {
+          }
+          else if (needsReadableBasename(path.basename(pathname))) {
+            // Improve label formatting for common filenames like index.js or styled.js
+            return createReadableBasename(pathname);
+          }
+          else {
             return path.basename(pathname);
           }
         })
@@ -332,6 +400,10 @@ function parseModule(m) {
     else if (isContextImport) {
       return 'unhandled context import: ' + m.name + '\n please consider adding code for this case';
     }
+    else if (needsReadableBasename(path.basename(m.name))) {
+      // Improve label formatting for common filenames like index.js or styled.js
+      return createReadableBasename(m.name);
+    }
     // note - file collisions can happen by stripping folders:
     return path.basename(m.name);
   }
@@ -343,7 +415,7 @@ function parseModule(m) {
     depth: m.depth,
     issuers: m.reasons
       // Filter out the "entry" reason, which is redundant as far as I can tell
-      .filter(d => d.type !== 'entry')
+      .filter(d => d.type !== 'entry' && !d.type.includes('self exports reference'))
       // Stats.js filters out modules only https://github.com/webpack/webpack/blob/5433b8cc785c6e71c29ce5f932ae6595f2d7acb5/lib/Stats.js#L335
       .map(d => ({
         // again make sure to use string for id:
@@ -360,6 +432,7 @@ function parseModule(m) {
     usedExports: m.usedExports || [],
     index: m.index,
     index2: m.index2,
+    reasons: m.reasons,
   }
 }
 
@@ -396,7 +469,8 @@ function buildGraph(stats) {
     stats.assets.forEach(asset => {
       const name = asset.name;
       const fileNode = graph.addNode(`file_${name}`, []);
-      const labels = [path.basename(name)];
+      const basename = path.basename(name);
+      const labels = [needsReadableBasename(basename) ? createReadableBasename(name) : basename];
       if (showSize) {
         labels.push(displaySize(asset.size));
       }
@@ -427,9 +501,12 @@ function buildGraph(stats) {
     const modules = p[1];
     const chunkIds = _.first(modules).chunks;
 
-    const allModules = modules
-      .map(parseModule)
-      .filter(showModule);
+    const allModules = modules.map(parseModule);
+    const allShownModules = allModules
+      .filter(showModule)
+      .filter(showModulePassTwo)
+      // Re-run pass two so that we hide modules whose issuers are hidden in Pass Two. Uhhh, don't keep multi-passing, though
+      .filter(showModulePassTwo);
 
     // const clusterDetails = parseClusterDetails(chunkIds.map(c => stats.chunks[c]));
     const clusterDetails = parseClusterDetails(chunkIds.map(c => stats.chunks.find(chunk => chunk.id === c)));
@@ -456,8 +533,9 @@ function buildGraph(stats) {
 
       styleModuleNode(node, m);
 
-      m.issuers.forEach(issuer => {
-        const edge = graph.addEdge(issuer.graphId, m.graphId, []);
+      const shownIssuers = m.issuers.filter(issuer => allShownModules.find(m => m.graphId === issuer.graphId));
+      shownIssuers.forEach(issuer => {
+        const edge = graph.addEdge(issuer.graphId, m.graphId);
         edge.set('arrowsize', '.75');
         edge.set('color', hslToGraphvizHsv([redHue, 58, 45]));
         if (showDependencyTypeAsEdgeLabel) {
@@ -482,6 +560,7 @@ function buildGraph(stats) {
         node.set('shape', 'rect');
       }
 
+      let didSetTooltip = false;
       // adding file content can be problematic, turn this off if you have issues rendering dot -> SVG
       // in this case I'm excluding files over 10,000 bytes (i.e. lodash) which fails to render in both URL and tooltip from my testing
       if (m.source && m.size < 10000) {
@@ -499,14 +578,25 @@ function buildGraph(stats) {
             .replace(/"/g, '\\"')
             .replace(/\n/g, '&#10;');
           node.set('tooltip', escapedSource);
+          didSetTooltip = true;
         }
 
       }
+
+      if (!didSetTooltip) {
+        node.set(
+          'tooltip',
+          m.packageDetails && m.packageDetails.name && m.packageDetails.filePath
+            ? path.join(m.packageDetails.name, m.packageDetails.filePath)
+            : m.name
+        );
+      }
+
       return node;
     }
 
-    const npmPackages = allModules.filter(m => m.packageDetails.name);
-    const appModules = _.difference(allModules, npmPackages);
+    const npmPackages = allShownModules.filter(m => m.packageDetails.name);
+    const appModules = _.difference(allShownModules, npmPackages);
 
     appModules.forEach(m => createModuleNode(chunkCluster, m));
 
@@ -521,15 +611,15 @@ function buildGraph(stats) {
         packageCluster.set('fillcolor', hslToGraphvizHsv([greenHue, 0, 85]));
         packageCluster.set('color', hslToGraphvizHsv([greenHue, 0, 45]));
         packageCluster.set('style', 'filled');
-        packageCluster.set('URL', resolveNpmPackagePage(packageName));
-        packageCluster.set('target', 'npm');
+        // packageCluster.set('URL', resolveNpmPackagePage(packageName));
+        // packageCluster.set('target', 'npm');
         const modules = packageModulesGrouping[1];
         modules.forEach(m => {
           const node = createModuleNode(packageCluster, m);
           // set aspects for modules in a package
           // link to unpkg to see source (version won't be guaranteed to be same)
-          node.set('URL', resolveUnpkgFile(m.packageDetails));
-          node.set('target', '_blank');
+          // node.set('URL', resolveUnpkgFile(m.packageDetails));
+          // node.set('target', '_blank');
         });
       });
 
@@ -709,17 +799,17 @@ function interactiveHtml(svgGraphFileName) {
   return `
 <!--
 * Copyright (c) 2015 Mountainstorm
-* 
+*
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
 * in the Software without restriction, including without limitation the rights
 * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 * copies of the Software, and to permit persons to whom the Software is
 * furnished to do so, subject to the following conditions:
-* 
+*
 * The above copyright notice and this permission notice shall be included in all
 * copies or substantial portions of the Software.
-* 
+*
 * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
