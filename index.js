@@ -74,6 +74,10 @@ const argv = yargs
     graphviz: {
       default: 'dot',
       description: 'The Graphviz layout algorithm to use: either dot, neato, fdp, sfdp, twopi or circo. See http://www.graphviz.org/#roadmap for more details.'
+    },
+    'extra-clusters-pattern': {
+      default: undefined,
+      description: 'A JavaScript regular expression string (case-insensitive) used to cluster modules that are not located within a node_modules folder.'
     }
   })
   .help()
@@ -103,6 +107,10 @@ const hideRegex = argv.hidePattern ? new RegExp(argv.hidePattern, 'i') : undefin
 
 const commonBasenamesRegex = argv.commonBasenamesPattern
   ? new RegExp(argv.commonBasenamesPattern, 'i')
+  : undefined;
+
+const extraClustersRegex = argv.extraClustersPattern
+  ? new RegExp(argv.extraClustersPattern, 'i')
   : undefined;
 
 const needsReadableBasename = (/** @type {string} */ filePath) => {
@@ -323,11 +331,13 @@ function parseModule(m) {
   // determine if module is a node_module npm package
   // yes I know this is confusing because we also use graph nodes to represent modules :)
   // split out inline loaders - a loader in the module request
+  /** @type {string[]} */
   const splitLoadersFromName = m.name.split('!');
   // last item is name even if no loaders
-  const nameWithoutLoaders = _.last(splitLoadersFromName);
+  const nameWithoutLoaders = splitLoadersFromName[splitLoadersFromName.length - 1];
   const packageDetails = {};
   const isNodeModule = nameWithoutLoaders.includes('node_modules');
+
   if (isNodeModule) {
     // say we have this package: "./node_modules/style-loader/lib/urls.js"
 
@@ -338,10 +348,18 @@ function parseModule(m) {
     packageDetails.name = extractPackageDetails ? extractPackageDetails[1] : '';
     // and filePath is lib/urls.js
     packageDetails.filePath = extractPackageDetails ? extractPackageDetails[2] : '';
-
-    // and filename is urls.js
-    packageDetails.filename = packageDetails.filePath ? path.basename(packageDetails.filePath) : '';
+  } else if (extraClustersRegex && extraClustersRegex.test(nameWithoutLoaders)) {
+    const nameMatch = nameWithoutLoaders.match(extraClustersRegex);
+    if (nameMatch) {
+      packageDetails.name = nameMatch[1] || nameMatch[0];
+      if (packageDetails.name.length > 0) {
+        packageDetails.filePath = nameWithoutLoaders.split(packageDetails.name).reverse()[0].replace(/^\//, '');
+        debugger;
+      }
+    }
   }
+  // and filename is urls.js
+  packageDetails.filename = packageDetails.filePath ? path.basename(packageDetails.filePath) : '';
 
   // context import detection
   // todo need to add more context detection for other context examples - this works for my course
@@ -533,8 +551,25 @@ function buildGraph(stats) {
 
       styleModuleNode(node, m);
 
-      const shownIssuers = m.issuers.filter(issuer => allShownModules.find(m => m.graphId === issuer.graphId));
-      shownIssuers.forEach(issuer => {
+      /**
+       * Filter and de-duplicate `issuers` so that we don't draw edges for hidden issuers. Why:
+       *
+       * 1. Graphviz adds a node for an edge if its origin / destination node doesn't exist, so
+       *    if we've hidden `issuer`'s corresponding node, then we need to determine (here) if
+       *    we should skip the edge from the hidden issuer module to module `m`.
+       *
+       * 2. webpack stats contain one "reason" (from which we derive `issuers`) for each import
+       *    from a source file, so if File A imports multiple named exports from File B, there
+       *    would be multiple arrows from File A -> File B...unless we de-duplicate `issuers`.
+       */
+      const shownIssuers = {};
+      m.issuers.forEach(issuer => {
+        const issuerModule = allShownModules.find(m => m.graphId === issuer.graphId);
+        if (issuerModule && issuer.graphId in shownIssuers === false) {
+          shownIssuers[issuer.graphId] = issuer;
+        }
+      });
+      Object.values(shownIssuers).forEach(issuer => {
         const edge = graph.addEdge(issuer.graphId, m.graphId);
         edge.set('arrowsize', '.75');
         edge.set('color', hslToGraphvizHsv([redHue, 58, 45]));
